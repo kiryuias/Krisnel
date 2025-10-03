@@ -1,0 +1,45 @@
+# a Linked List Node
+class Node:
+  
+  	# constructor to intialize a node with data
+    def __init__(self, x):
+        self.data = x
+        self.next = None
+
+# checks whether key is present in linked list
+def search_key(head, key):
+  
+    # initialize curr with the head of linked list
+    curr = head
+
+    # iterate over all the nodes
+    while curr is not None:
+
+        # if the current node's value is equal to key,
+        # return true
+        if curr.data == key:
+            return True
+
+        # move to the next node
+        curr = curr.next
+
+    # if there is no node with value as key, return false
+    return False
+
+if __name__ == "__main__":
+
+    # create a hard-coded linked list:
+    # 1 -> 2 -> 3 -> 4 -> 5
+    head = Node(1)
+    head.next = Node(2)
+    head.next.next = Node(3)
+    head.next.next.next = Node(4)
+    head.next.next.next.next = Node(5)
+
+    # key to search in the linked list
+    key = 5
+
+    if search_key(head, key):
+        print("true")
+    else:
+        print("false")
