@@ -22,7 +22,7 @@ def traverseList(head):
     # moving to the next node
     traverseList(head.next)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     # create a hard-coded linked list:
     # 10 -> 20 -> 30 -> 40
     head = Node(10)
