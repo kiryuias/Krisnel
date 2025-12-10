@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+</head>
+<body>
+
+<?php
+				$name = $program = $student = $grade = $pointBase = "";
+				$name = $_POST["name"];
+				$program = $_POST["program"];
+				$student = $_POST["student"];
+				$grade = $_POST["grade"];
+				$pointBase = 0;
+				
+				
+				if ($grade >= 98 && $grade <= 100)
+				{
+					echo "Excellent";
+					echo "<br>";
+					$pointBase = 1.0;
+					<img src ="<php echo ="Smile.gif">
+				}
+				else if ($grade >= 95 && $grade <= 97)
+				{
+					echo "Perfect";
+					echo "<br>";
+					$pointBase = 1.5;
+				}
+				else if ($grade >= 90 && $grade <= 94)
+				{
+					echo "Very Good";
+					echo "<br>";
+					$pointBase = 1.75;
+				}
+				else if ($grade >= 85 && $grade <= 89)
+				{
+					echo "Good";
+					echo "<br>";
+					$pointBase = 2.0;
+				}
+				else if ($grade >= 75 && $grade <= 84)
+				{
+					echo "Passed";
+					echo "<br>";
+					$pointBase = 3.0;
+				}
+				else if ($grade >= 50 && $grade <= 74)
+				{
+					echo "Failed";
+					echo "<br>";
+					$pointBase = 5.0;
+				}
+				else if ($grade >= 0 && $grade <= 49)
+				{
+					echo "Grade undefine";
+					echo "<br>";
+				}
+				
+				echo "Hi, $name with student number $student of $program your grade $grade is Equivalent to $pointBase Congrats Excellent";
+			?>
+	</body>
+</html>
