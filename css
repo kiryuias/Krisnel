@@ -1,0 +1,13 @@
+.block1{
+	border:5px Solid black;
+	width:300px;
+	height:70px;
+}
+.block2{
+	border:5px Solid red;
+	width:300px;
+	height:70px;
+	margin-top:-80px;
+	margin-left:310px;
+}
+	
