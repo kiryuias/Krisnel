@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<body>
+	<link rel="stylesheet" href="aics.css">
+
+</head>
+<body>
+	<div class="block1">
+	<form method ="post">
+	First Number<input type ="number" name="fnum">
+	Second Number<input type ="number" name="snum">
+	<input type="Submit" value="Enter">
+	</form>
+	</div>
+	
+	<div class="block2">
+		<?php
+			$fnum = $_POST["fnum"];
+			$snum = $_POST["snum"];
+	
+			echo $fnum." and ".$snum;
+			echo "<br>";
+			if($fnum > $snum){
+				echo $fnum." is HIGHER";	
+			}
+			else if($fnum < $snum){
+				echo $snum." is HIGHER";
+			}
+			else{
+				echo "BOTH ARE EQUAL";
+			}
+?>
+	</div>
+
+</body>
+</html>
