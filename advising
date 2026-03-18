@@ -1,0 +1,1242 @@
+<?php
+// ============================================================
+// ScholarGate – Academic Advising System  |  Single File PHP
+// ============================================================
+// SETUP:
+//   1. Import scholargate.sql in phpMyAdmin
+//   2. Adjust DB credentials below if needed
+//   3. Place this file in your web server root (e.g. htdocs/index.php)
+//   4. Visit http://localhost/
+// ============================================================
+
+session_start();
+
+define('DB_HOST','localhost');
+define('DB_NAME','scholargate');
+define('DB_USER','root');
+define('DB_PASS','');
+
+function db(){
+    static $pdo=null;
+    if(!$pdo){
+        try{
+            $pdo=new PDO("mysql:host=".DB_HOST.";dbname=".DB_NAME.";charset=utf8mb4",
+                DB_USER,DB_PASS,[PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
+                                  PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
+        }catch(PDOException $e){
+            header('Content-Type: application/json');
+            echo json_encode(['error'=>'DB error: '.$e->getMessage()]);exit;
+        }
+    }
+    return $pdo;
+}
+function resp($d){header('Content-Type: application/json');echo json_encode($d);exit;}
+function need_auth(){if(!isset($_SESSION['uid']))resp(['error'=>'Not logged in']);}
+function need_role($r){need_auth();if(!in_array($_SESSION['role'],(array)$r))resp(['error'=>'Access denied']);}
+
+function get_user($id){
+    $s=db()->prepare("SELECT * FROM users WHERE id=?");$s->execute([$id]);
+    $u=$s->fetch();if(!$u)return null;
+    unset($u['password']);
+    if($u['role']==='student'){
+        $si=db()->prepare("SELECT * FROM student_info WHERE user_id=?");$si->execute([$id]);
+        $u['si']=$si->fetch()?:[];
+        $gr=db()->prepare("SELECT subject_code,grade FROM grades WHERE user_id=?");$gr->execute([$id]);
+        $u['si']['grades']=[];
+        foreach($gr->fetchAll() as $g) $u['si']['grades'][$g['subject_code']]=(float)$g['grade'];
+    }
+    return $u;
+}
+
+// ── AJAX HANDLER ──────────────────────────────────────────────
+if(isset($_POST['action'])||isset($_GET['action'])){
+    $act=$_POST['action']??$_GET['action']??'';
+    switch($act){
+
+    case 'login':
+        $s=db()->prepare("SELECT * FROM users WHERE email=?");$s->execute([$_POST['email']??'']);
+        $u=$s->fetch();
+        if(!$u||$u['password']!==($_POST['password']??'')) resp(['error'=>'Invalid email or password.']);
+        if($u['role']==='student'&&$u['status']==='pending')  resp(['error'=>'Account pending admin approval.']);
+        if($u['role']==='student'&&$u['status']==='rejected') resp(['error'=>'Account rejected. Contact admin.']);
+        $_SESSION['uid']=$u['id'];$_SESSION['role']=$u['role'];
+        resp(['ok'=>1,'user'=>get_user($u['id'])]);
+
+    case 'logout':
+        session_destroy();resp(['ok'=>1]);
+
+    case 'me':
+        need_auth();resp(['user'=>get_user($_SESSION['uid'])]);
+
+    case 'register':
+        $email=trim($_POST['email']??'');
+        $c=db()->prepare("SELECT id FROM users WHERE email=?");$c->execute([$email]);
+        if($c->fetch()) resp(['error'=>'Email already registered.']);
+        db()->prepare("INSERT INTO users(name,email,password,role,status,created_at) VALUES(?,?,?,'student','pending',CURDATE())")
+           ->execute([$_POST['name']??'',$email,$_POST['password']??'']);
+        $uid=db()->lastInsertId();
+        db()->prepare("INSERT INTO student_info(user_id,student_id,program,year_level,semester,student_type,contact,address,manual_note,manual_subjects) VALUES(?,?,?,?,?,?,?,?,'','')")
+           ->execute([$uid,'',$_POST['program']??'BSCS',$_POST['year_level']??'1st Year',
+                      $_POST['semester']??'1st Sem',$_POST['student_type']??'new',
+                      $_POST['contact']??'',$_POST['address']??'']);
+        resp(['ok'=>1]);
+
+    case 'get_students':
+        need_role(['admin','superadmin']);
+        $rows=db()->query("SELECT u.*,si.id si_id,si.student_id,si.program,si.year_level,si.semester,si.student_type,si.contact,si.address,si.manual_note,si.manual_subjects FROM users u LEFT JOIN student_info si ON u.id=si.user_id WHERE u.role='student' ORDER BY u.created_at DESC")->fetchAll();
+        foreach($rows as &$r){
+            unset($r['password']);
+            $g=db()->prepare("SELECT subject_code,grade FROM grades WHERE user_id=?");$g->execute([$r['id']]);
+            $r['grades']=[];foreach($g->fetchAll() as $x) $r['grades'][$x['subject_code']]=(float)$x['grade'];
+        }
+        resp(['students'=>$rows]);
+
+    case 'get_admins':
+        need_role('superadmin');
+        resp(['admins'=>db()->query("SELECT id,name,email,status,created_at FROM users WHERE role='admin' ORDER BY created_at DESC")->fetchAll()]);
+
+    case 'get_curriculum':
+        need_auth();
+        $p=db()->query("SELECT * FROM curriculum_periods ORDER BY program,sort_order")->fetchAll();
+        $s=db()->query("SELECT cs.id,cs.period_id,cs.subject_code,cs.subject_title,cs.units,GROUP_CONCAT(sp.prereq_code ORDER BY sp.id SEPARATOR ',') prereqs FROM curriculum_subjects cs LEFT JOIN subject_prerequisites sp ON cs.id=sp.subject_id GROUP BY cs.id ORDER BY cs.id")->fetchAll();
+        resp(['periods'=>$p,'subjects'=>$s]);
+
+    case 'save_grades':
+        need_role('student');$uid=$_SESSION['uid'];
+        $grades=json_decode($_POST['grades']??'{}',true)??[];
+        foreach($grades as $code=>$grade){
+            $c=db()->prepare("SELECT id FROM grades WHERE user_id=? AND subject_code=?");$c->execute([$uid,$code]);
+            if($c->fetch()) db()->prepare("UPDATE grades SET grade=? WHERE user_id=? AND subject_code=?")->execute([$grade,$uid,$code]);
+            else db()->prepare("INSERT INTO grades(user_id,subject_code,grade) VALUES(?,?,?)")->execute([$uid,$code,$grade]);
+        }
+        resp(['ok'=>1,'user'=>get_user($uid)]);
+
+    case 'update_profile':
+        need_role('student');$uid=$_SESSION['uid'];
+        db()->prepare("UPDATE student_info SET program=?,year_level=?,semester=?,student_type=?,contact=?,address=? WHERE user_id=?")
+           ->execute([$_POST['program'],$_POST['year_level'],$_POST['semester'],$_POST['student_type'],$_POST['contact'],$_POST['address'],$uid]);
+        resp(['ok'=>1,'user'=>get_user($uid)]);
+
+    case 'approve_student':
+        need_role(['admin','superadmin']);
+        db()->prepare("UPDATE users SET status='approved' WHERE id=? AND role='student'")->execute([$_POST['id']]);
+        resp(['ok'=>1]);
+
+    case 'reject_student':
+        need_role(['admin','superadmin']);
+        db()->prepare("UPDATE users SET status='rejected' WHERE id=? AND role='student'")->execute([$_POST['id']]);
+        resp(['ok'=>1]);
+
+    case 'save_special':
+        need_role(['admin','superadmin']);
+        db()->prepare("UPDATE student_info SET manual_note=?,manual_subjects=? WHERE user_id=?")
+           ->execute([$_POST['note']??'',$_POST['subjects']??'',$_POST['uid']]);
+        resp(['ok'=>1]);
+
+    case 'create_admin':
+        need_role('superadmin');$email=trim($_POST['email']??'');
+        $c=db()->prepare("SELECT id FROM users WHERE email=?");$c->execute([$email]);
+        if($c->fetch()) resp(['error'=>'Email already in use.']);
+        db()->prepare("INSERT INTO users(name,email,password,role,status,created_at) VALUES(?,?,?,'admin','active',CURDATE())")
+           ->execute([$_POST['name']??'',$email,$_POST['password']??'']);
+        resp(['ok'=>1,'id'=>db()->lastInsertId()]);
+
+    case 'toggle_admin':
+        need_role('superadmin');
+        $r=db()->prepare("SELECT status FROM users WHERE id=? AND role='admin'");$r->execute([$_POST['id']]);
+        $row=$r->fetch();if(!$row)resp(['error'=>'Not found']);
+        $ns=$row['status']==='active'?'inactive':'active';
+        db()->prepare("UPDATE users SET status=? WHERE id=?")->execute([$ns,$_POST['id']]);
+        resp(['ok'=>1,'status'=>$ns]);
+
+    case 'add_period':
+        need_role('superadmin');
+        $pn=trim($_POST['period_name']??'');$pg=$_POST['program']??'';
+        $c=db()->prepare("SELECT id FROM curriculum_periods WHERE program=? AND period_name=?");$c->execute([$pg,$pn]);
+        if($c->fetch())resp(['error'=>'Period already exists.']);
+        $m=db()->prepare("SELECT MAX(sort_order) m FROM curriculum_periods WHERE program=?");$m->execute([$pg]);
+        $so=($m->fetch()['m']??0)+1;
+        db()->prepare("INSERT INTO curriculum_periods(program,period_name,sort_order) VALUES(?,?,?)")->execute([$pg,$pn,$so]);
+        resp(['ok'=>1,'id'=>db()->lastInsertId()]);
+
+    case 'add_subject':
+        need_role('superadmin');
+        $code=strtoupper(trim($_POST['code']??''));$title=trim($_POST['title']??'');
+        $pg=$_POST['program']??'';$per=$_POST['period']??'';$units=(int)($_POST['units']??3);
+        $prereqs=array_filter(array_map('trim',explode(',',strtoupper($_POST['prereqs']??''))));
+        $pid=db()->prepare("SELECT id FROM curriculum_periods WHERE program=? AND period_name=?");$pid->execute([$pg,$per]);
+        $p=$pid->fetch();if(!$p)resp(['error'=>'Period not found.']);
+        $ex=db()->prepare("SELECT id FROM curriculum_subjects WHERE period_id=? AND subject_code=?");$ex->execute([$p['id'],$code]);
+        if($ex->fetch())resp(['error'=>'Code already exists in this period.']);
+        db()->prepare("INSERT INTO curriculum_subjects(period_id,subject_code,subject_title,units) VALUES(?,?,?,?)")->execute([$p['id'],$code,$title,$units]);
+        $sid=db()->lastInsertId();
+        foreach($prereqs as $pr) if($pr) db()->prepare("INSERT INTO subject_prerequisites(subject_id,prereq_code) VALUES(?,?)")->execute([$sid,$pr]);
+        resp(['ok'=>1]);
+
+    case 'remove_subject':
+        need_role('superadmin');
+        db()->prepare("DELETE FROM curriculum_subjects WHERE id=?")->execute([$_POST['id']]);
+        resp(['ok'=>1]);
+
+    default: resp(['error'=>'Unknown action']);
+    }
+    exit;
+}
+
+$loggedIn=isset($_SESSION['uid']);
+$initRole=$_SESSION['role']??'';
+?><!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ScholarGate – Academic Advising System</title>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700;900&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#0f1923;--navy:#1a3054;--navy2:#243d6a;
+  --gold:#c8860a;--gold-mid:#f5c75a;
+  --slate:#f4f6fa;--white:#fff;--muted:#6b7a99;
+  --border:#dde3f0;--green:#1a7a4a;--gbg:#e6f7ee;
+  --red:#be2a2a;--rbg:#fdeaea;--blue:#1c5cad;--bbg:#e8f0fb;
+  --amber:#a0620a;--abg:#fef3d5;
+  --r:10px;--sh:0 2px 16px rgba(15,25,35,.08);
+}
+html,body{min-height:100%;font-family:'DM Sans',sans-serif;background:var(--slate);color:var(--ink)}
+button,input,select,textarea{font-family:'DM Sans',sans-serif}button{cursor:pointer}
+.toast{position:fixed;top:18px;right:18px;z-index:9999;padding:11px 18px 11px 14px;border-radius:8px;
+  font-size:13.5px;font-weight:600;box-shadow:0 6px 24px rgba(0,0,0,.18);
+  display:flex;align-items:center;gap:8px;animation:toastIn .25s ease;pointer-events:none}
+@keyframes toastIn{from{transform:translateX(80px);opacity:0}to{transform:none;opacity:1}}
+.toast-success{background:var(--gbg);color:var(--green);border-left:4px solid var(--green)}
+.toast-error{background:var(--rbg);color:var(--red);border-left:4px solid var(--red)}
+.toast-info{background:var(--bbg);color:var(--blue);border-left:4px solid var(--blue)}
+/* AUTH */
+.auth{min-height:100vh;display:flex}
+.auth-panel{width:420px;background:var(--navy);display:flex;flex-direction:column;justify-content:center;padding:52px 44px;position:relative;overflow:hidden}
+.auth-panel::before{content:'';position:absolute;top:-80px;left:-80px;width:300px;height:300px;border-radius:50%;background:rgba(200,134,10,.12);pointer-events:none}
+.auth-panel::after{content:'';position:absolute;bottom:-60px;right:-60px;width:220px;height:220px;border-radius:50%;background:rgba(200,134,10,.08);pointer-events:none}
+.brand{font-family:'Fraunces',serif;font-size:34px;color:#fff;line-height:1;position:relative;z-index:1}
+.brand em{color:var(--gold-mid);font-style:normal}
+.brand-sub{font-size:11.5px;color:rgba(255,255,255,.4);letter-spacing:.8px;text-transform:uppercase;margin-top:5px;position:relative;z-index:1}
+.auth-feats{margin-top:34px;display:flex;flex-direction:column;gap:14px;position:relative;z-index:1}
+.auth-feat{display:flex;align-items:flex-start;gap:10px}
+.feat-dot{width:7px;height:7px;border-radius:50%;background:var(--gold-mid);margin-top:5px;flex-shrink:0}
+.feat-txt{font-size:13px;color:rgba(255,255,255,.65);line-height:1.5}
+.auth-form-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:32px}
+.auth-box{width:100%;max-width:420px}
+.form-title{font-family:'Fraunces',serif;font-size:27px;color:var(--navy);margin-bottom:4px}
+.form-sub{font-size:13px;color:var(--muted);margin-bottom:22px}
+.demo-box{background:var(--slate);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:18px}
+.demo-box h4{font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin-bottom:6px}
+.demo-row{font-size:12.5px;color:#374151;line-height:2}
+.demo-row strong{color:var(--navy)}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:12.5px;font-weight:600;color:var(--ink);margin-bottom:5px}
+.field input,.field select,.field textarea{width:100%;padding:10px 13px;border:1.5px solid var(--border);border-radius:8px;font-size:14px;color:var(--ink);outline:none;background:#fff;transition:border .18s}
+.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--navy)}
+.field-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.err-msg{background:var(--rbg);color:var(--red);border-radius:7px;padding:9px 12px;font-size:13px;margin:10px 0}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 18px;border-radius:8px;font-size:13.5px;font-weight:600;border:none;transition:all .18s;cursor:pointer}
+.btn-primary{background:var(--navy);color:#fff;width:100%;justify-content:center}
+.btn-primary:hover{background:var(--navy2)}
+.btn-gold{background:var(--gold);color:#fff}
+.btn-gold:hover{background:#a67008}
+.btn-ghost{background:transparent;border:1.5px solid var(--border);color:var(--ink)}
+.btn-ghost:hover{background:var(--slate)}
+.btn-sm{padding:6px 12px;font-size:12.5px}
+.btn-ok{background:var(--gbg);color:var(--green);border:1px solid #a7dbbe}
+.btn-ok:hover{background:#c8f0da}
+.btn-bad{background:var(--rbg);color:var(--red);border:1px solid #f5b8b8}
+.btn-bad:hover{background:#f9cece}
+.link-btn{background:none;border:none;color:var(--navy);font-weight:600;font-size:13px;text-decoration:underline;padding:0;cursor:pointer}
+.auth-switch{text-align:center;margin-top:14px;font-size:13px;color:var(--muted)}
+/* LAYOUT */
+.app-layout{display:flex;min-height:100vh}
+.sidebar{width:236px;background:var(--navy);display:flex;flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh;overflow-y:auto}
+.sb-brand{padding:20px 18px 16px;border-bottom:1px solid rgba(255,255,255,.08)}
+.sb-brand-name{font-family:'Fraunces',serif;font-size:19px;color:#fff}
+.sb-brand-name em{color:var(--gold-mid);font-style:normal}
+.sb-brand-tag{font-size:10px;color:rgba(255,255,255,.3);text-transform:uppercase;letter-spacing:.8px;margin-top:2px}
+.sb-user{padding:13px 18px;border-bottom:1px solid rgba(255,255,255,.08)}
+.sb-name{font-size:14px;font-weight:600;color:#fff}
+.sb-role{font-size:10.5px;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.6px;margin-top:2px}
+.sb-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;margin-top:5px}
+.sb-student{background:rgba(200,134,10,.25);color:var(--gold-mid)}
+.sb-admin{background:rgba(26,122,74,.25);color:#6ee39f}
+.sb-superadmin{background:rgba(168,85,247,.25);color:#d8b4fe}
+.sb-info{font-size:11px;color:rgba(255,255,255,.35);margin-top:3px}
+.sb-nav{padding:10px 8px;flex:1}
+.sb-section{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:rgba(255,255,255,.25);padding:10px 10px 4px}
+.nav-btn{display:flex;align-items:center;gap:9px;width:100%;padding:9px 11px;border-radius:7px;border:none;background:none;color:rgba(255,255,255,.6);font-size:13px;font-weight:500;text-align:left;cursor:pointer;transition:all .18s;margin-bottom:2px}
+.nav-btn:hover{background:rgba(255,255,255,.07);color:#fff}
+.nav-btn.active{background:var(--gold);color:#fff;font-weight:600}
+.nav-ico{font-size:15px;width:20px;text-align:center;flex-shrink:0}
+.sb-foot{padding:12px 18px;border-top:1px solid rgba(255,255,255,.08)}
+.logout-btn{width:100%;padding:9px;background:rgba(255,255,255,.06);border:none;border-radius:7px;color:rgba(255,255,255,.6);font-size:13px;font-weight:500;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;transition:all .18s}
+.logout-btn:hover{background:rgba(190,42,42,.3);color:#fca5a5}
+.main-area{flex:1;overflow-y:auto;background:var(--slate)}
+.topbar{background:#fff;padding:14px 26px;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:10;display:flex;align-items:center;justify-content:space-between}
+.topbar-title{font-family:'Fraunces',serif;font-size:18px;color:var(--navy)}
+.topbar-sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.page{padding:22px 26px}
+/* CARDS */
+.card{background:#fff;border-radius:var(--r);border:1px solid var(--border);padding:18px;box-shadow:var(--sh);margin-bottom:16px}
+.card-head{font-size:14px;font-weight:700;color:var(--navy);margin-bottom:14px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+/* STAT */
+.stat{background:#fff;border-radius:var(--r);border:1px solid var(--border);padding:16px;position:relative;overflow:hidden}
+.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.sn::before{background:var(--navy)}.sg::before{background:var(--gold)}.sv::before{background:var(--green)}.sr::before{background:var(--red)}
+.stat-val{font-family:'Fraunces',serif;font-size:28px;color:var(--navy);margin-bottom:3px}
+.stat-lbl{font-size:11.5px;color:var(--muted);font-weight:500}
+.stat-ico{position:absolute;right:14px;top:50%;transform:translateY(-50%);font-size:28px;opacity:.1}
+/* TABLE */
+.tbl-wrap{overflow-x:auto;border-radius:8px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse}
+th{background:var(--slate);padding:9px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);border-bottom:1px solid var(--border)}
+td{padding:10px 12px;font-size:13px;border-bottom:1px solid #f0f3fa;color:#374151}
+tr:last-child td{border-bottom:none}tr:hover td{background:#fafbff}
+tfoot td{background:var(--slate)!important;font-weight:700;color:var(--navy)}
+/* BADGE */
+.bdg{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px;font-weight:600}
+.bp{background:var(--abg);color:var(--amber)}.ba{background:var(--gbg);color:var(--green)}.br{background:var(--rbg);color:var(--red)}
+.bn{background:var(--bbg);color:var(--blue)}.bo{background:#f0ebff;color:#6d28d9}.bt{background:#fce7f3;color:#9d174d}
+.chip{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:600;background:var(--slate);color:#4b5a7a}
+/* ALERT */
+.alert{padding:11px 14px;border-radius:8px;font-size:13px;margin-bottom:14px}
+.al-w{background:var(--abg);border:1px solid #f5c75a;color:var(--amber)}
+.al-i{background:var(--bbg);border:1px solid #aac4ee;color:var(--blue)}
+.al-ok{background:var(--gbg);border:1px solid #a7dbbe;color:var(--green)}
+/* GRADE */
+.grade-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.gi label{font-size:12px;font-weight:600;color:var(--ink);display:block;margin-bottom:2px}
+.gi .sub{font-size:11px;color:var(--muted);margin-bottom:4px}
+.gi input{width:100%;padding:7px 10px;border:1.5px solid var(--border);border-radius:6px;font-size:14px;outline:none}
+.gi input:focus{border-color:var(--navy)}
+.gi input.gp{border-color:var(--green);background:#f2fbf6}
+.gi input.gf{border-color:var(--red);background:#fdf2f2}
+/* EVAL */
+.ev-block{padding:13px;border-radius:8px;margin-bottom:10px}
+.evp{background:var(--gbg);border:1px solid #a7dbbe}
+.evf{background:var(--rbg);border:1px solid #f5b8b8}
+.evi{background:var(--bbg);border:1px solid #aac4ee}
+.ev-head{font-size:13px;font-weight:700;margin-bottom:8px}
+.ev-tags{display:flex;flex-wrap:wrap;gap:5px}
+.etag{padding:3px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.etp{background:#bbf7d0;color:#166534}.etf{background:#fecaca;color:#991b1b}.etr{background:#bfdbfe;color:#1e40af}
+/* REG FORM */
+.reg-box{background:#fff;border:1px solid var(--border);border-radius:8px;padding:26px}
+.reg-hdr{text-align:center;margin-bottom:18px;padding-bottom:14px;border-bottom:2.5px solid var(--navy)}
+.reg-hdr h2{font-family:'Fraunces',serif;font-size:21px;color:var(--navy)}
+.reg-hdr p{color:var(--muted);font-size:12.5px;margin-top:3px}
+.reg-meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+.rmi label{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);font-weight:700}
+.rmi p{font-size:13.5px;font-weight:600;margin-top:2px;padding-bottom:4px;border-bottom:1px solid var(--border)}
+.sig-row{display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:28px}
+.sig-line{border-top:1.5px solid #ccc;padding-top:5px;font-size:11.5px;color:var(--muted);text-align:center}
+/* MODAL */
+.overlay{position:fixed;inset:0;background:rgba(10,20,40,.5);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:#fff;border-radius:12px;padding:22px;width:100%;max-width:490px;box-shadow:0 24px 60px rgba(0,0,0,.22);max-height:88vh;overflow-y:auto}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.modal-title{font-family:'Fraunces',serif;font-size:16px;color:var(--navy)}
+.close-x{background:none;border:none;font-size:18px;color:var(--muted);cursor:pointer}
+.divider{border:none;border-top:1px solid var(--border);margin:14px 0}
+.kv{display:flex;justify-content:space-between;font-size:13px;padding:6px 0;border-bottom:1px solid #f0f3fa}
+.kv:last-child{border-bottom:none}
+.kv-k{color:var(--muted)}.kv-v{font-weight:600}
+/* MISC */
+.empty{text-align:center;padding:38px;color:var(--muted)}
+.empty-ico{font-size:38px;margin-bottom:10px}
+.s-inp{padding:8px 12px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;outline:none;transition:border .18s}
+.s-inp:focus{border-color:var(--navy)}
+.f-sel{padding:7px 10px;border:1.5px solid var(--border);border-radius:8px;font-size:13px;outline:none;background:#fff}
+.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.loading{display:flex;align-items:center;justify-content:center;min-height:100vh;font-size:14px;color:var(--muted)}
+@media print{.sidebar,.topbar,.no-print{display:none!important}.main-area{padding:0!important}.page{padding:12px!important}}
+</style>
+</head>
+<body>
+<div id="app"><div class="loading">Loading ScholarGate…</div></div>
+<script>
+// ============================================================
+// STATE
+// ============================================================
+const A={
+  page:<?=json_encode($loggedIn?'dash':'login')?>,
+  user:null,students:[],admins:[],curriculum:{},currPeriods:[],
+  tab:'',modal:null,
+  gradeInputs:{},evalResult:null,
+  specNotes:{},specSubjs:{},
+  stuFilter:{q:'',prog:'all',status:'all',type:'all'},
+  currProg:'BSCS',currPeriod:'',
+  newSubj:{code:'',title:'',units:'3',prereqs:''},
+  newPer:'',
+  newAdm:{name:'',email:'',pass:''},
+};
+
+// ============================================================
+// UTILITIES
+// ============================================================
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function toast(msg,type='success'){
+  let el=document.getElementById('_toast');
+  if(!el){el=document.createElement('div');el.id='_toast';document.body.appendChild(el);}
+  el.className='toast toast-'+type;
+  el.innerHTML=(type==='success'?'✅':type==='error'?'❌':'ℹ️')+' '+esc(msg);
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{if(el.parentNode)el.remove();},3200);
+}
+function bdg(s){return{pending:'bp',approved:'ba',rejected:'br',active:'ba',inactive:'br'}[s]||'';}
+function tbdg(t){return{new:'bn',old:'bo',transferee:'bt'}[t]||'';}
+function today(){return new Date().toLocaleDateString('en-PH',{weekday:'long',year:'numeric',month:'long',day:'numeric'});}
+function statHTML(val,lbl,c,ico){return`<div class="stat ${c}"><div class="stat-val">${esc(val)}</div><div class="stat-lbl">${lbl}</div><div class="stat-ico">${ico}</div></div>`;}
+function kvHTML(k,v){return`<div class="kv"><span class="kv-k">${k}</span><span class="kv-v">${esc(v||'—')}</span></div>`;}
+function alertHTML(type,msg){return`<div class="alert ${type}">${msg}</div>`;}
+function emptyHTML(ico,msg){return`<div class="empty"><div class="empty-ico">${ico}</div><p style="font-size:13px">${msg}</p></div>`;}
+
+// ============================================================
+// API
+// ============================================================
+async function api(action,data={}){
+  const f=new FormData();f.append('action',action);
+  for(const[k,v]of Object.entries(data))f.append(k,v);
+  try{const r=await fetch(location.href,{method:'POST',body:f});return await r.json();}
+  catch(e){return{error:'Network error'};}
+}
+
+// ============================================================
+// CURRICULUM BUILDER
+// ============================================================
+function buildCurr(periods,subjects){
+  const c={};
+  for(const p of periods){if(!c[p.program])c[p.program]={};c[p.program][p.period_name]=[];}
+  for(const s of subjects){
+    const p=periods.find(x=>x.id==s.period_id);
+    if(p&&c[p.program]&&c[p.program][p.period_name]!==undefined){
+      c[p.program][p.period_name].push({id:s.id,code:s.subject_code,title:s.subject_title,
+        units:parseInt(s.units),prereqs:s.prereqs?s.prereqs.split(',').filter(Boolean):[]});
+    }
+  }
+  return c;
+}
+
+// ============================================================
+// DATA LOADING
+// ============================================================
+async function loadData(){
+  const[me,curr]=await Promise.all([api('me'),api('get_curriculum')]);
+  if(me.user)A.user=me.user;
+  if(curr.periods){A.currPeriods=curr.periods;A.curriculum=buildCurr(curr.periods,curr.subjects||[]);}
+  if(A.user){
+    A.gradeInputs={...(A.user.si?.grades||{})};
+    if(!A.curriculum[A.currProg])A.currProg=Object.keys(A.curriculum)[0]||'BSCS';
+    const ps=Object.keys(A.curriculum[A.currProg]||{});
+    if(!A.currPeriod||!A.curriculum[A.currProg]?.[A.currPeriod])A.currPeriod=ps[0]||'';
+    A.tab=A.user.role==='student'?'home':A.user.role==='admin'?'pending':'admins';
+  }
+  if(A.user?.role==='admin'||A.user?.role==='superadmin'){const s=await api('get_students');if(s.students)A.students=s.students;}
+  if(A.user?.role==='superadmin'){const ad=await api('get_admins');if(ad.admins)A.admins=ad.admins;}
+}
+async function refStudents(){const s=await api('get_students');if(s.students)A.students=s.students;}
+async function refAdmins(){const a=await api('get_admins');if(a.admins)A.admins=a.admins;}
+async function refCurr(){
+  const r=await api('get_curriculum');
+  if(r.periods){A.currPeriods=r.periods;A.curriculum=buildCurr(r.periods,r.subjects||[]);
+  const ps=Object.keys(A.curriculum[A.currProg]||{});
+  if(!A.currPeriod||!A.curriculum[A.currProg]?.[A.currPeriod])A.currPeriod=ps[0]||'';}
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function render(){
+  const app=document.getElementById('app');
+  if(A.page==='login')app.innerHTML=loginHTML();
+  else if(A.page==='register')app.innerHTML=registerHTML();
+  else if(A.page==='dash')app.innerHTML=dashHTML();
+}
+function renderContent(){const c=document.getElementById('content-area');if(c)c.innerHTML=contentHTML();else render();}
+
+// ============================================================
+// HTML: LOGIN
+// ============================================================
+function loginHTML(){return`
+<div class="auth">
+  <div class="auth-panel">
+    <div class="brand">Scholar<em>Gate</em></div>
+    <div class="brand-sub">Academic Advising System</div>
+    <div class="auth-feats">
+      ${['Smart grade evaluation & prerequisite checking','Automated registration form generation',
+         '3-tier system: Student, Admin, Super Admin','Curriculum editor per degree program']
+        .map(t=>`<div class="auth-feat"><div class="feat-dot"></div><div class="feat-txt">${t}</div></div>`).join('')}
+    </div>
+  </div>
+  <div class="auth-form-wrap">
+    <div class="auth-box">
+      <h2 class="form-title">Sign In</h2>
+      <p class="form-sub">Access your advising portal</p>
+      <div class="demo-box">
+        <h4>Demo Credentials</h4>
+        <div class="demo-row">
+          <strong>Super Admin:</strong> super@school.edu / super123<br>
+          <strong>Admin:</strong> admin@school.edu / admin123<br>
+          <strong>Student:</strong> juan@school.edu / juan123
+        </div>
+      </div>
+      <div class="field"><label>Email Address</label><input id="l-email" type="email" placeholder="you@school.edu"></div>
+      <div class="field"><label>Password</label><input id="l-pass" type="password" placeholder="••••••••"></div>
+      <div id="l-err"></div>
+      <button class="btn btn-primary" style="margin-top:6px" data-a="do-login">Sign In →</button>
+      <div class="auth-switch">New student? <button class="link-btn" data-a="go-reg">Create an Account</button></div>
+    </div>
+  </div>
+</div>`;}
+
+// ============================================================
+// HTML: REGISTER
+// ============================================================
+function registerHTML(){return`
+<div style="min-height:100vh;background:var(--navy);display:flex;align-items:center;justify-content:center;padding:20px">
+  <div style="background:#fff;border-radius:14px;padding:28px;width:100%;max-width:560px;max-height:95vh;overflow-y:auto">
+    <button class="btn btn-ghost btn-sm" style="margin-bottom:14px" data-a="go-login">← Back to Login</button>
+    <h2 class="form-title">Student Registration</h2>
+    <p class="form-sub" style="margin-bottom:18px">Create your academic advising account</p>
+    <div id="r-err"></div>
+    <div class="field-2">
+      <div class="field"><label>Full Name *</label><input id="r-name" placeholder="Juan dela Cruz"></div>
+      <div class="field"><label>Email Address *</label><input id="r-email" type="email" placeholder="you@school.edu"></div>
+    </div>
+    <div class="field-2">
+      <div class="field"><label>Password *</label><input id="r-pass" type="password" placeholder="Min. 6 characters"></div>
+      <div class="field"><label>Confirm Password *</label><input id="r-pass2" type="password" placeholder="Re-enter password"></div>
+    </div>
+    <div class="field-2">
+      <div class="field"><label>Contact Number *</label><input id="r-contact" placeholder="09XXXXXXXXX"></div>
+      <div class="field"><label>Address</label><input id="r-address" placeholder="City, Province"></div>
+    </div>
+    <div class="field-2">
+      <div class="field"><label>Program</label>
+        <select id="r-prog"><option value="BSCS">BSCS – Computer Science</option><option value="BSIT">BSIT – Information Technology</option></select>
+      </div>
+      <div class="field"><label>Student Status</label>
+        <select id="r-type" data-a="r-type-change">
+          <option value="new">New Student</option><option value="old">Old Student</option><option value="transferee">Transferee</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-2">
+      <div class="field"><label>Year Level</label>
+        <select id="r-year">${['1st Year','2nd Year','3rd Year','4th Year'].map(y=>`<option>${y}</option>`).join('')}</select>
+      </div>
+      <div class="field"><label>Semester</label>
+        <select id="r-sem">${['1st Sem','2nd Sem','Summer'].map(s=>`<option>${s}</option>`).join('')}</select>
+      </div>
+    </div>
+    <div id="r-transferee" style="display:none" class="alert al-w">⚠ As a transferee, your subjects will be manually evaluated by the academic adviser. Bring your official TOR to the Registrar.</div>
+    <button class="btn btn-primary" data-a="do-register">Submit Registration →</button>
+  </div>
+</div>`;}
+
+// ============================================================
+// HTML: DASHBOARD SHELL
+// ============================================================
+function dashHTML(){
+  const u=A.user,role=u.role;
+  const tabs=role==='student'?[{id:'home',i:'🏠',l:'Overview'},{id:'grades',i:'📊',l:'Grade Evaluation'},{id:'regform',i:'📋',l:'Registration Form'},{id:'profile',i:'👤',l:'My Profile'}]
+    :role==='admin'?[{id:'pending',i:'⏳',l:'Pending Approvals'},{id:'students',i:'🎓',l:'Student Management'},{id:'reports',i:'📈',l:'Reports'},{id:'special',i:'📂',l:'Special Cases'}]
+    :[{id:'admins',i:'👥',l:'Admin Accounts'},{id:'allstu',i:'🎓',l:'All Students'},{id:'curriculum',i:'📚',l:'Curriculum Editor'},{id:'sreports',i:'📊',l:'Reports'}];
+  const cur=tabs.find(t=>t.id===A.tab)||tabs[0];
+  const rl={student:'Student',admin:'Administrator',superadmin:'Super Admin'};
+  return`
+<div class="app-layout">
+  <div class="sidebar">
+    <div class="sb-brand"><div class="sb-brand-name">Scholar<em>Gate</em></div><div class="sb-brand-tag">Advising System</div></div>
+    <div class="sb-user">
+      <div class="sb-name">${esc(u.name)}</div><div class="sb-role">${role}</div>
+      <span class="sb-badge sb-${role}">${rl[role]}</span>
+      ${role==='student'?`<div class="sb-info">${esc(u.si?.program||'')} · ${esc(u.si?.year_level||'')}</div>`:''}
+    </div>
+    <div class="sb-nav"><div class="sb-section">Menu</div>
+      ${tabs.map(t=>`<button class="nav-btn${A.tab===t.id?' active':''}" data-a="nav" data-tab="${t.id}"><span class="nav-ico">${t.i}</span>${t.l}</button>`).join('')}
+    </div>
+    <div class="sb-foot"><button class="logout-btn" data-a="do-logout">🚪 Sign Out</button></div>
+  </div>
+  <div class="main-area">
+    <div class="topbar">
+      <div><div class="topbar-title">${cur.i} ${cur.l}</div><div class="topbar-sub">${today()}</div></div>
+      ${role==='student'?`<span class="bdg ${tbdg(u.si?.student_type)}" style="font-size:12px;padding:4px 11px">${((u.si?.student_type||'')).replace(/^\w/,c=>c.toUpperCase())} Student</span>`:''}
+    </div>
+    <div class="page" id="content-area">${contentHTML()}</div>
+  </div>
+</div>
+${A.modal?modalHTML():''}`;
+}
+
+function contentHTML(){
+  const t=A.tab,role=A.user?.role;
+  if(role==='student'){
+    if(t==='home')    return stuHomeHTML();
+    if(t==='grades')  return stuGradesHTML();
+    if(t==='regform') return stuRegFormHTML();
+    if(t==='profile') return stuProfileHTML();
+    return stuHomeHTML();
+  }
+  if(role==='admin'){
+    if(t==='pending')  return adminPendingHTML();
+    if(t==='students') return adminStudentsHTML();
+    if(t==='reports')  return reportsHTML();
+    if(t==='special')  return adminSpecialHTML();
+    return adminPendingHTML();
+  }
+  if(role==='superadmin'){
+    if(t==='admins')     return superAdminsHTML();
+    if(t==='allstu')     return adminStudentsHTML();
+    if(t==='curriculum') return curriculumHTML();
+    if(t==='sreports')   return reportsHTML();
+    return superAdminsHTML();
+  }
+  return '';
+}
+
+// ============================================================
+// STUDENT PAGES
+// ============================================================
+function stuHomeHTML(){
+  const u=A.user,si=u.si||{};
+  const prog=A.curriculum[si.program]||{};
+  const all=Object.values(prog).flat();
+  const totalU=all.reduce((a,s)=>a+s.units,0);
+  const passed=Object.entries(si.grades||{}).filter(([,g])=>g>=75);
+  const passedU=passed.reduce((a,[c])=>{const s=all.find(x=>x.code===c);return a+(s?.units||0);},0);
+  const pct=totalU?Math.round(passedU/totalU*100):0;
+  return`
+<div class="g4" style="margin-bottom:16px">
+  ${statHTML(si.program||'—','Program','sn','🎓')}
+  ${statHTML(si.year_level||'—','Year Level','sg','📅')}
+  ${statHTML(passed.length,'Passed Subjects','sv','✅')}
+  ${statHTML(pct+'%','Curriculum Done','sr','📊')}
+</div>
+<div class="g2">
+  <div class="card">
+    <div class="card-head">📌 Academic Summary</div>
+    ${[['Student ID',si.student_id||'Pending'],['Program',si.program],['Year Level',si.year_level],
+      ['Semester',si.semester],['Student Type',si.student_type],
+      ['Units Completed',passedU+' / '+totalU],['Account Status',u.status]].map(([k,v])=>kvHTML(k,v)).join('')}
+  </div>
+  <div class="card">
+    <div class="card-head">ℹ️ Adviser Notes</div>
+    ${alertHTML('al-i',si.student_type==='new'?'👋 Welcome! You are a new student. Visit the Registrar to confirm enrollment.'
+      :si.student_type==='old'?'✅ Welcome back! Ensure grades are updated before enrolling.'
+      :'📂 As a transferee, subjects will be manually evaluated by your adviser.')}
+    <div style="font-size:13px;color:var(--muted);line-height:2">
+      <div>📞 <b style="color:var(--ink)">${esc(si.contact||'N/A')}</b></div>
+      <div>📍 <b style="color:var(--ink)">${esc(si.address||'N/A')}</b></div>
+      <div>📅 Registered: <b style="color:var(--ink)">${esc(u.created_at)}</b></div>
+    </div>
+    ${si.manual_note?alertHTML('al-w','📋 Adviser: '+esc(si.manual_note)):''}
+    ${si.manual_subjects?alertHTML('al-ok','✅ Accredited: '+esc(si.manual_subjects)):''}
+  </div>
+</div>`;}
+
+function stuGradesHTML(){
+  const u=A.user,si=u.si||{};
+  if(si.student_type==='transferee') return`
+  <div class="card"><div class="card-head">📊 Grade Evaluation</div>
+    ${alertHTML('al-w','⚠ As a transferee, your records must be manually verified. Submit your official TOR to the Registrar\'s Office.')}
+    ${si.manual_subjects?alertHTML('al-ok','✅ Accredited subjects: '+esc(si.manual_subjects)):''}
+    ${si.manual_note?alertHTML('al-i','📋 Adviser\'s note: '+esc(si.manual_note)):''}
+  </div>`;
+  const period=`${si.year_level} - ${si.sem||si.semester}`;
+  const prog=A.curriculum[si.program]||{};
+  const curSubs=prog[period]||[];
+  const evalR=A.evalResult;
+  return`
+<div class="card">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+    <div class="card-head" style="margin:0;border:0;padding:0">📊 Grades — ${esc(period)}</div>
+    <div class="row no-print">
+      <button class="btn btn-ghost btn-sm" data-a="save-grades">💾 Save Grades</button>
+      <button class="btn btn-gold btn-sm" data-a="eval-grades">🔍 Evaluate</button>
+    </div>
+  </div>
+  <p style="font-size:12px;color:var(--muted);margin-bottom:14px">Enter your grades. Passing mark: <b>75</b> and above.</p>
+  ${curSubs.length===0?emptyHTML('📭','No subjects for "'+period+'". Update your Year Level & Semester in Profile.')
+  :`<div class="grade-grid">${curSubs.map(s=>{
+    const val=A.gradeInputs[s.code]??'';
+    const cls=val!==''?(parseFloat(val)>=75?'gp':'gf'):'';
+    return`<div class="gi"><label>${esc(s.title)}</label>
+    <div class="sub">${esc(s.code)} · ${s.units}u${s.prereqs.length?' · Pre: '+esc(s.prereqs.join(', ')):''}
+    </div><input type="number" min="0" max="100" placeholder="0 – 100" class="${cls}" data-grade="${esc(s.code)}" value="${esc(val)}"></div>`;
+  }).join('')}</div>`}
+</div>
+${evalR?`
+<div class="card"><div class="card-head">📋 Evaluation Result</div>
+  ${evalR.passed.length?`<div class="ev-block evp"><div class="ev-head" style="color:var(--green)">✅ Passed (${evalR.passed.length})</div><div class="ev-tags">${evalR.passed.map(c=>`<span class="etag etp">${esc(c)}</span>`).join('')}</div></div>`:''}
+  ${evalR.retake.length?`<div class="ev-block evf"><div class="ev-head" style="color:var(--red)">❌ For Retaking (${evalR.retake.length})</div><div class="ev-tags">${evalR.retake.map(s=>`<span class="etag etf">${esc(s.code)}: ${esc(s.title)}</span>`).join('')}</div></div>`:''}
+  ${evalR.nextSubs.length?`<div class="ev-block evi"><div class="ev-head" style="color:var(--blue)">📌 Recommended for ${esc(evalR.nextPeriod)} (${evalR.nextSubs.length})</div><div class="ev-tags">${evalR.nextSubs.map(s=>`<span class="etag etr">${esc(s.code)}: ${esc(s.title)} (${s.units}u)</span>`).join('')}</div></div>`:''}
+  ${evalR.nextSubs.length===0&&evalR.nextPeriod?alertHTML('al-w','⚠ Unmet prerequisites. Retake failed subjects before proceeding to '+esc(evalR.nextPeriod)+'.'):''}
+</div>`:''}`;
+}
+
+function stuRegFormHTML(){
+  const u=A.user,si=u.si||{};
+  const period=`${si.year_level} - ${si.sem||si.semester}`;
+  const prog=A.curriculum[si.program]||{};
+  const passed=Object.entries(si.grades||{}).filter(([,g])=>g>=75).map(([c])=>c);
+  const eligible=(prog[period]||[]).filter(s=>s.prereqs.every(p=>passed.includes(p)));
+  const totalU=eligible.reduce((a,s)=>a+s.units,0);
+  return`
+<div class="row no-print" style="justify-content:flex-end;margin-bottom:12px">
+  <button class="btn btn-gold btn-sm" data-a="print">🖨️ Print Form</button>
+</div>
+<div class="reg-box">
+  <div class="reg-hdr">
+    <h2>🎓 ScholarGate University</h2>
+    <p>Academic Advising &amp; Enrollment Registration Form</p>
+    <p style="font-size:11px;color:#aaa;margin-top:3px">A.Y. 2024–2025 · ${esc(period)}</p>
+  </div>
+  <div class="reg-meta">
+    ${[['Student Name',u.name],['Student ID',si.student_id||'Pending'],
+      ['Program',si.program],['Year Level',si.year_level],
+      ['Semester',si.sem||si.semester],['Student Type',(si.student_type||'').toUpperCase()]]
+      .map(([l,v])=>`<div class="rmi"><label>${l}</label><p>${esc(v||'—')}</p></div>`).join('')}
+  </div>
+  <div class="card-head" style="margin-bottom:12px">📚 Subjects for Enrollment</div>
+  ${si.student_type==='transferee'
+    ?alertHTML('al-w','⚠ Transferee: Subjects will be determined after manual evaluation by the Academic Adviser.')
+    :`<div class="tbl-wrap"><table>
+      <thead><tr><th>#</th><th>Code</th><th>Subject Title</th><th style="text-align:center">Units</th><th>Prerequisites</th><th>Status</th></tr></thead>
+      <tbody>
+        ${eligible.length===0?`<tr><td colspan="6" style="text-align:center;padding:18px;color:var(--muted)">No eligible subjects. Complete prerequisites first.</td></tr>`
+          :eligible.map((s,i)=>`<tr><td>${i+1}</td><td><b>${esc(s.code)}</b></td><td>${esc(s.title)}</td><td style="text-align:center">${s.units}</td>
+            <td style="font-size:12px;color:var(--muted)">${s.prereqs.join(', ')||'None'}</td>
+            <td><span class="bdg ba">Eligible</span></td></tr>`).join('')}
+        ${eligible.length?`<tr><tfoot><td colspan="3" style="padding:9px 12px;font-weight:700">TOTAL UNITS</td><td style="text-align:center;font-weight:700">${totalU}</td><td colspan="2"></td></tfoot></tr>`:''}
+      </tbody>
+    </table></div>
+    <div class="sig-row">
+      <div><div style="height:40px"></div><div class="sig-line">Academic Adviser</div></div>
+      <div><div style="height:40px"></div><div class="sig-line">${esc(u.name)}</div></div>
+    </div>`}
+</div>`;}
+
+function stuProfileHTML(){
+  const si=A.user?.si||{};
+  return`
+<div class="card"><div class="card-head">👤 Edit My Profile</div>
+  <div class="field-2">
+    <div class="field"><label>Program</label><select id="p-prog">
+      <option value="BSCS"${si.program==='BSCS'?' selected':''}>BSCS – Computer Science</option>
+      <option value="BSIT"${si.program==='BSIT'?' selected':''}>BSIT – Information Technology</option>
+    </select></div>
+    <div class="field"><label>Student Status</label><select id="p-type">
+      ${['new','old','transferee'].map(t=>`<option value="${t}"${si.student_type===t?' selected':''}>${t.charAt(0).toUpperCase()+t.slice(1)}</option>`).join('')}
+    </select></div>
+  </div>
+  <div class="field-2">
+    <div class="field"><label>Year Level</label><select id="p-year">
+      ${['1st Year','2nd Year','3rd Year','4th Year'].map(y=>`<option${si.year_level===y?' selected':''}>${y}</option>`).join('')}
+    </select></div>
+    <div class="field"><label>Semester</label><select id="p-sem">
+      ${['1st Sem','2nd Sem','Summer'].map(s=>`<option${(si.sem||si.semester)===s?' selected':''}>${s}</option>`).join('')}
+    </select></div>
+  </div>
+  <div class="field-2">
+    <div class="field"><label>Contact Number</label><input id="p-contact" value="${esc(si.contact||'')}"></div>
+    <div class="field"><label>Address</label><input id="p-addr" value="${esc(si.address||'')}"></div>
+  </div>
+  <button class="btn btn-primary" style="width:auto" data-a="save-profile">💾 Save Changes</button>
+</div>`;}
+
+// ============================================================
+// ADMIN PAGES
+// ============================================================
+function adminPendingHTML(){
+  const pending=A.students.filter(s=>s.status==='pending');
+  const approved=A.students.filter(s=>s.status==='approved').length;
+  const rejected=A.students.filter(s=>s.status==='rejected').length;
+  return`
+<div class="g4" style="margin-bottom:16px">
+  ${statHTML(pending.length,'Pending','sg','⏳')}
+  ${statHTML(approved,'Approved','sv','✅')}
+  ${statHTML(rejected,'Rejected','sr','❌')}
+  ${statHTML(A.students.length,'Total Students','sn','🎓')}
+</div>
+<div class="card">
+  <div class="card-head">⏳ Pending Registrations (${pending.length})</div>
+  ${pending.length===0?emptyHTML('🎉','All registrations have been processed!')
+  :`<div class="tbl-wrap"><table>
+    <thead><tr><th>Name</th><th>Email</th><th>Program</th><th>Year</th><th>Type</th><th>Registered</th><th>Actions</th></tr></thead>
+    <tbody>${pending.map(s=>`<tr>
+      <td><b>${esc(s.name)}</b></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(s.email)}</td>
+      <td><span class="chip">${esc(s.program)}</span></td>
+      <td style="font-size:12px">${esc(s.year_level)}</td>
+      <td><span class="bdg ${tbdg(s.student_type)}">${esc(s.student_type)}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(s.created_at)}</td>
+      <td><div class="row">
+        <button class="btn btn-ok btn-sm" data-a="approve" data-id="${s.id}">✅ Approve</button>
+        <button class="btn btn-bad btn-sm" data-a="reject" data-id="${s.id}">❌ Reject</button>
+        <button class="btn btn-ghost btn-sm" data-a="view-stu" data-id="${s.id}">👁 View</button>
+      </div></td>
+    </tr>`).join('')}</tbody>
+  </table></div>`}
+</div>`;}
+
+function adminStudentsHTML(){
+  const f=A.stuFilter;
+  const list=A.students.filter(s=>
+    (!f.q||s.name.toLowerCase().includes(f.q.toLowerCase())||s.email.includes(f.q)||(s.student_id||'').includes(f.q))&&
+    (f.prog==='all'||s.program===f.prog)&&(f.status==='all'||s.status===f.status)&&(f.type==='all'||s.student_type===f.type));
+  return`
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;margin-bottom:14px">
+    <div class="card-head" style="margin:0;border:0;padding:0">🎓 Students (${list.length})</div>
+    <div class="row">
+      <input class="s-inp" style="width:190px" placeholder="🔍 Name / email / ID" id="stu-q" value="${esc(f.q)}" data-a="stu-filter-q">
+      <select class="f-sel" id="stu-prog" data-a="stu-filter-prog">
+        <option value="all"${f.prog==='all'?' selected':''}>All Programs</option>
+        <option value="BSCS"${f.prog==='BSCS'?' selected':''}>BSCS</option>
+        <option value="BSIT"${f.prog==='BSIT'?' selected':''}>BSIT</option>
+      </select>
+      <select class="f-sel" id="stu-status" data-a="stu-filter-status">
+        <option value="all"${f.status==='all'?' selected':''}>All Status</option>
+        <option value="approved"${f.status==='approved'?' selected':''}>Approved</option>
+        <option value="pending"${f.status==='pending'?' selected':''}>Pending</option>
+        <option value="rejected"${f.status==='rejected'?' selected':''}>Rejected</option>
+      </select>
+      <select class="f-sel" id="stu-type" data-a="stu-filter-type">
+        <option value="all"${f.type==='all'?' selected':''}>All Types</option>
+        <option value="new"${f.type==='new'?' selected':''}>New</option>
+        <option value="old"${f.type==='old'?' selected':''}>Old</option>
+        <option value="transferee"${f.type==='transferee'?' selected':''}>Transferee</option>
+      </select>
+    </div>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Student ID</th><th>Name</th><th>Program</th><th>Year</th><th>Type</th><th>Status</th><th>Grades</th><th>Action</th></tr></thead>
+    <tbody>
+      ${list.length===0?`<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--muted)">No students match the filters.</td></tr>`
+        :list.map(s=>`<tr>
+        <td style="font-size:11px;font-family:monospace">${esc(s.student_id||'—')}</td>
+        <td><b>${esc(s.name)}</b></td>
+        <td><span class="chip">${esc(s.program)}</span></td>
+        <td style="font-size:12px">${esc(s.year_level)}</td>
+        <td><span class="bdg ${tbdg(s.student_type)}">${esc(s.student_type)}</span></td>
+        <td><span class="bdg ${bdg(s.status)}">${esc(s.status)}</span></td>
+        <td style="font-size:12px;color:var(--muted)">${Object.keys(s.grades||{}).length} subjects</td>
+        <td><button class="btn btn-ghost btn-sm" data-a="view-stu" data-id="${s.id}">View</button></td>
+      </tr>`).join('')}
+    </tbody>
+  </table></div>
+</div>`;}
+
+function reportsHTML(){
+  const stu=A.students;
+  const byProg={BSCS:stu.filter(s=>s.program==='BSCS').length,BSIT:stu.filter(s=>s.program==='BSIT').length};
+  const byType={new:stu.filter(s=>s.student_type==='new').length,old:stu.filter(s=>s.student_type==='old').length,transferee:stu.filter(s=>s.student_type==='transferee').length};
+  return`
+<div class="row no-print" style="justify-content:flex-end;margin-bottom:12px">
+  <button class="btn btn-gold btn-sm" data-a="print">🖨️ Print Report</button>
+</div>
+<div class="card">
+  <div class="card-head">📈 Student Overview</div>
+  <div class="g4">${statHTML(stu.length,'Total','sn','👥')}${statHTML(stu.filter(s=>s.status==='approved').length,'Approved','sv','✅')}${statHTML(stu.filter(s=>s.status==='pending').length,'Pending','sg','⏳')}${statHTML(stu.filter(s=>s.status==='rejected').length,'Rejected','sr','❌')}</div>
+</div>
+<div class="g2">
+  <div class="card"><div class="card-head">📚 By Program</div><div class="tbl-wrap"><table>
+    <thead><tr><th>Program</th><th>Count</th><th>Share</th></tr></thead>
+    <tbody>${Object.entries(byProg).map(([p,c])=>`<tr><td><b>${p}</b></td><td>${c}</td><td>${stu.length?Math.round(c/stu.length*100):0}%</td></tr>`).join('')}</tbody>
+  </table></div></div>
+  <div class="card"><div class="card-head">👤 By Type</div><div class="tbl-wrap"><table>
+    <thead><tr><th>Type</th><th>Count</th></tr></thead>
+    <tbody>${Object.entries(byType).map(([t,c])=>`<tr><td><span class="bdg ${tbdg(t)}">${t}</span></td><td>${c}</td></tr>`).join('')}</tbody>
+  </table></div></div>
+</div>
+<div class="card"><div class="card-head">📋 Complete Student Registry</div><div class="tbl-wrap"><table>
+  <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Program</th><th>Year</th><th>Type</th><th>Status</th></tr></thead>
+  <tbody>${stu.map(s=>`<tr>
+    <td style="font-size:11px;font-family:monospace">${esc(s.student_id||'—')}</td>
+    <td><b>${esc(s.name)}</b></td><td style="font-size:12px;color:var(--muted)">${esc(s.email)}</td>
+    <td>${esc(s.program)}</td><td style="font-size:12px">${esc(s.year_level)}</td>
+    <td><span class="bdg ${tbdg(s.student_type)}">${esc(s.student_type)}</span></td>
+    <td><span class="bdg ${bdg(s.status)}">${esc(s.status)}</span></td>
+  </tr>`).join('')}</tbody>
+</table></div></div>`;}
+
+function adminSpecialHTML(){
+  const tf=A.students.filter(s=>s.student_type==='transferee');
+  return`
+${alertHTML('al-w','⚠ This section handles transferee students and special cases requiring manual evaluation.')}
+${tf.length===0?`<div class="card">${emptyHTML('📂','No transferee students at this time.')}</div>`
+  :tf.map(s=>`
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:12px">
+    <div>
+      <div style="font-weight:700;font-size:15px;color:var(--navy)">${esc(s.name)}</div>
+      <div style="font-size:12px;color:var(--muted);margin-top:2px">${esc(s.email)} · ${esc(s.program)} · ${esc(s.year_level)} · ${esc(s.contact)}</div>
+    </div>
+    <span class="bdg ${bdg(s.status)}">${esc(s.status)}</span>
+  </div>
+  <div class="field"><label>✅ Accredited Subjects (comma-separated codes)</label>
+    <input id="sp-subj-${s.id}" placeholder="e.g., CC101, MATH111, GE101" value="${esc(A.specSubjs[s.id]??s.manual_subjects??'')}">
+  </div>
+  <div class="field"><label>📝 Adviser's Notes / Evaluation Remarks</label>
+    <textarea rows="3" id="sp-note-${s.id}" placeholder="Enter evaluation remarks...">${esc(A.specNotes[s.id]??s.manual_note??'')}</textarea>
+  </div>
+  <div class="row">
+    <button class="btn btn-primary btn-sm" style="width:auto" data-a="save-special" data-uid="${s.id}">💾 Save</button>
+    ${s.status!=='approved'?`<button class="btn btn-ok btn-sm" data-a="approve" data-id="${s.id}">✅ Approve</button>`:''}
+  </div>
+</div>`).join('')}`;}
+
+// ============================================================
+// SUPER ADMIN PAGES
+// ============================================================
+function superAdminsHTML(){
+  return`
+<div class="card">
+  <div class="card-head">➕ Create New Admin Account</div>
+  <div class="field-2">
+    <div class="field"><label>Full Name *</label><input id="na-name" value="${esc(A.newAdm.name)}" placeholder="Dr. Ana Reyes"></div>
+    <div class="field"><label>Email Address *</label><input id="na-email" value="${esc(A.newAdm.email)}" type="email" placeholder="admin@school.edu"></div>
+  </div>
+  <div class="field" style="max-width:240px"><label>Password *</label><input id="na-pass" type="password" placeholder="Min. 6 characters"></div>
+  <div id="na-err"></div>
+  <button class="btn btn-primary" style="width:auto" data-a="create-admin">➕ Create Admin</button>
+</div>
+<div class="card">
+  <div class="card-head">👥 Admin Accounts (${A.admins.length})</div>
+  ${A.admins.length===0?emptyHTML('👥','No admin accounts yet.')
+  :`<div class="tbl-wrap"><table>
+    <thead><tr><th>Name</th><th>Email</th><th>Status</th><th>Created</th><th>Action</th></tr></thead>
+    <tbody>${A.admins.map(a=>`<tr>
+      <td><b>${esc(a.name)}</b></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(a.email)}</td>
+      <td><span class="bdg ${bdg(a.status)}">${esc(a.status)}</span></td>
+      <td style="font-size:12px;color:var(--muted)">${esc(a.created_at)}</td>
+      <td><button class="btn btn-ghost btn-sm" data-a="toggle-admin" data-id="${a.id}">${a.status==='active'?'Deactivate':'Activate'}</button></td>
+    </tr>`).join('')}</tbody>
+  </table></div>`}
+</div>`;}
+
+function curriculumHTML(){
+  const progs=Object.keys(A.curriculum);
+  const periods=Object.keys(A.curriculum[A.currProg]||{});
+  const subjects=A.curriculum[A.currProg]?.[A.currPeriod]||[];
+  const totalU=subjects.reduce((a,s)=>a+s.units,0);
+  return`
+<div class="card">
+  <div class="card-head">⚙️ Select Program & Period</div>
+  <div class="row" style="gap:14px;flex-wrap:wrap">
+    <div>
+      <div style="font-size:12px;font-weight:600;margin-bottom:5px">Program</div>
+      <select class="f-sel" id="curr-prog" data-a="curr-prog-change">
+        ${progs.map(p=>`<option${A.currProg===p?' selected':''}>${esc(p)}</option>`).join('')}
+      </select>
+    </div>
+    <div>
+      <div style="font-size:12px;font-weight:600;margin-bottom:5px">Period / Semester</div>
+      <select class="f-sel" id="curr-period" data-a="curr-period-change">
+        ${periods.map(p=>`<option${A.currPeriod===p?' selected':''}>${esc(p)}</option>`).join('')}
+      </select>
+    </div>
+    <div>
+      <div style="font-size:12px;font-weight:600;margin-bottom:5px">Add New Period</div>
+      <div class="row">
+        <input class="s-inp" style="width:180px" id="new-per" placeholder='e.g. "3rd Year - 1st Sem"' value="${esc(A.newPer)}">
+        <button class="btn btn-gold btn-sm" data-a="add-period">+ Add</button>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="card">
+  <div class="card-head">➕ Add Subject — ${esc(A.currProg)} · ${esc(A.currPeriod)}</div>
+  <div class="field-2">
+    <div class="field"><label>Subject Code *</label><input id="ns-code" value="${esc(A.newSubj.code)}" placeholder="e.g., CC301"></div>
+    <div class="field"><label>Subject Title *</label><input id="ns-title" value="${esc(A.newSubj.title)}" placeholder="e.g., Software Engineering"></div>
+  </div>
+  <div class="field-2">
+    <div class="field"><label>Units</label>
+      <select id="ns-units">${[1,2,3,4,5,6].map(u=>`<option${A.newSubj.units==u?' selected':''}>${u}</option>`).join('')}</select>
+    </div>
+    <div class="field"><label>Prerequisites (comma-separated codes)</label>
+      <input id="ns-prereqs" value="${esc(A.newSubj.prereqs)}" placeholder="e.g., CC201, CC202 (leave blank if none)">
+    </div>
+  </div>
+  <div id="ns-err"></div>
+  <button class="btn btn-primary" style="width:auto" data-a="add-subject">➕ Add Subject</button>
+</div>
+<div class="card">
+  <div class="card-head">📚 ${esc(A.currProg)} — ${esc(A.currPeriod)} <span style="font-weight:400;font-size:12px;color:var(--muted)">(${subjects.length} subjects · ${totalU} total units)</span></div>
+  ${subjects.length===0?emptyHTML('📭','No subjects yet. Add them above.')
+  :`<div class="tbl-wrap"><table>
+    <thead><tr><th>Code</th><th>Subject Title</th><th style="text-align:center">Units</th><th>Prerequisites</th><th>Action</th></tr></thead>
+    <tbody>${subjects.map(s=>`<tr>
+      <td><b style="font-family:monospace">${esc(s.code)}</b></td>
+      <td>${esc(s.title)}</td>
+      <td style="text-align:center">${s.units}</td>
+      <td>${s.prereqs.length===0?'<span style="font-size:12px;color:var(--muted)">None</span>':s.prereqs.map(p=>`<span class="chip" style="margin-right:3px">${esc(p)}</span>`).join('')}</td>
+      <td><button class="btn btn-bad btn-sm" data-a="rm-subject" data-id="${s.id}">🗑 Remove</button></td>
+    </tr>`).join('')}</tbody>
+  </table></div>`}
+</div>`;}
+
+// ============================================================
+// MODAL
+// ============================================================
+function modalHTML(){
+  const m=A.modal;
+  if(!m) return '';
+  if(m.type==='student'){
+    const s=m.data;
+    return`
+<div class="overlay" data-a="close-modal">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-head">
+      <div class="modal-title">🎓 ${esc(s.name)}</div>
+      <button class="close-x" data-a="close-modal">✕</button>
+    </div>
+    <div class="g2">
+      ${[['ID',s.student_id],['Program',s.program],['Year',s.year_level],['Semester',s.semester],
+         ['Type',s.student_type],['Status',s.status],['Email',s.email],['Contact',s.contact]]
+        .map(([k,v])=>`<div style="padding:5px 0;border-bottom:1px solid #f0f3fa">
+          <div style="font-size:10.5px;font-weight:700;text-transform:uppercase;color:var(--muted)">${k}</div>
+          <div style="font-size:13px;font-weight:600;margin-top:2px">${esc(v||'N/A')}</div>
+        </div>`).join('')}
+    </div>
+    <div class="divider"></div>
+    <div style="font-weight:700;font-size:13px;margin-bottom:8px">📊 Grade Records (${Object.keys(s.grades||{}).length})</div>
+    <div style="display:flex;flex-wrap:wrap;gap:5px">
+      ${Object.keys(s.grades||{}).length===0?'<span style="font-size:13px;color:var(--muted)">No grades recorded yet.</span>'
+        :Object.entries(s.grades).map(([c,g])=>`<span style="padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600;background:${g>=75?'#bbf7d0':'#fecaca'};color:${g>=75?'#166534':'#991b1b'}">${esc(c)}: ${g}</span>`).join('')}
+    </div>
+    <div class="divider"></div>
+    <div class="row">
+      ${s.status!=='approved'?`<button class="btn btn-ok btn-sm" data-a="approve" data-id="${s.id}">✅ Approve</button>`:''}
+      ${s.status!=='rejected'?`<button class="btn btn-bad btn-sm" data-a="reject" data-id="${s.id}">❌ Reject</button>`:''}
+    </div>
+  </div>
+</div>`;
+  }
+  return '';
+}
+
+// ============================================================
+// ACTIONS
+// ============================================================
+async function doLogin(){
+  const email=document.getElementById('l-email')?.value||'';
+  const pass=document.getElementById('l-pass')?.value||'';
+  const r=await api('login',{email,password:pass});
+  if(r.error){const el=document.getElementById('l-err');if(el)el.innerHTML=`<div class="err-msg">⚠ ${esc(r.error)}</div>`;}
+  else if(r.user){
+    A.user=r.user;A.gradeInputs={...(r.user.si?.grades||{})};
+    A.page='dash';A.tab=r.user.role==='student'?'home':r.user.role==='admin'?'pending':'admins';
+    await loadData();render();
+  }
+}
+
+async function doRegister(){
+  const g=id=>document.getElementById(id)?.value||'';
+  const name=g('r-name'),email=g('r-email'),pass=g('r-pass'),pass2=g('r-pass2');
+  const errEl=document.getElementById('r-err');
+  const showErr=msg=>{if(errEl)errEl.innerHTML=`<div class="err-msg">⚠ ${esc(msg)}</div>`;};
+  if(!name||!email||!pass||!g('r-contact')){showErr('Please fill all required fields.');return;}
+  if(pass!==pass2){showErr('Passwords do not match.');return;}
+  if(pass.length<6){showErr('Password must be at least 6 characters.');return;}
+  const r=await api('register',{name,email,password:pass,program:g('r-prog'),
+    year_level:g('r-year'),semester:g('r-sem'),student_type:g('r-type'),
+    contact:g('r-contact'),address:g('r-addr')});
+  if(r.error)showErr(r.error);
+  else{A.page='login';render();toast('Registration submitted! Awaiting admin approval.','info');}
+}
+
+async function doLogout(){
+  await api('logout');A.user=null;A.students=[];A.admins=[];
+  A.page='login';A.tab='';render();
+}
+
+function evalGrades(){
+  const si=A.user?.si||{},prog=A.curriculum[si.program]||{};
+  const period=`${si.year_level} - ${si.sem||si.semester}`;
+  const gmap={...(si.grades||{}),...Object.fromEntries(Object.entries(A.gradeInputs).filter(([,v])=>v!==''&&!isNaN(parseFloat(v))).map(([k,v])=>[k,parseFloat(v)]))};
+  const passed=Object.entries(gmap).filter(([,g])=>g>=75).map(([c])=>c);
+  const failed=Object.entries(gmap).filter(([,g])=>g<75).map(([c])=>c);
+  const allS=Object.values(prog).flat();
+  const perKeys=Object.keys(prog);
+  const ci=perKeys.indexOf(period);
+  const nextPeriod=perKeys[ci+1];
+  const nextSubs=nextPeriod?(prog[nextPeriod]||[]).filter(s=>s.prereqs.every(p=>passed.includes(p))):[];
+  const retake=allS.filter(s=>failed.includes(s.code));
+  A.evalResult={passed,failed,retake,nextSubs,nextPeriod};
+  renderContent();
+}
+
+async function saveGrades(){
+  const grades={};
+  Object.entries(A.gradeInputs).forEach(([k,v])=>{if(v!==''&&!isNaN(parseFloat(v)))grades[k]=parseFloat(v);});
+  const r=await api('save_grades',{grades:JSON.stringify(grades)});
+  if(r.error)toast(r.error,'error');
+  else{if(r.user)A.user=r.user;A.gradeInputs={...(A.user.si?.grades||{})};A.evalResult=null;toast('Grades saved!');renderContent();}
+}
+
+async function saveProfile(){
+  const g=id=>document.getElementById(id)?.value||'';
+  const r=await api('update_profile',{program:g('p-prog'),year_level:g('p-year'),
+    semester:g('p-sem'),student_type:g('p-type'),contact:g('p-contact'),address:g('p-addr')});
+  if(r.error)toast(r.error,'error');
+  else{if(r.user){A.user=r.user;A.gradeInputs={...(A.user.si?.grades||{})};} toast('Profile updated!');renderContent();}
+}
+
+async function approveStudent(id){
+  const r=await api('approve_student',{id});
+  if(r.error)toast(r.error,'error');
+  else{A.students=A.students.map(s=>s.id==id?{...s,status:'approved'}:s);
+    if(A.modal?.data?.id==id)A.modal.data.status='approved';
+    toast('Student approved!');renderContent();}
+}
+
+async function rejectStudent(id){
+  const r=await api('reject_student',{id});
+  if(r.error)toast(r.error,'error');
+  else{A.students=A.students.map(s=>s.id==id?{...s,status:'rejected'}:s);
+    if(A.modal?.data?.id==id)A.modal.data.status='rejected';
+    toast('Student rejected.','error');renderContent();}
+}
+
+async function saveSpecial(uid){
+  const note=document.getElementById('sp-note-'+uid)?.value||'';
+  const subj=document.getElementById('sp-subj-'+uid)?.value||'';
+  A.specNotes[uid]=note;A.specSubjs[uid]=subj;
+  const r=await api('save_special',{uid,note,subjects:subj});
+  if(r.error)toast(r.error,'error');
+  else{A.students=A.students.map(s=>s.id==uid?{...s,manual_note:note,manual_subjects:subj}:s);toast('Evaluation saved!');}
+}
+
+async function createAdmin(){
+  const name=document.getElementById('na-name')?.value||'';
+  const email=document.getElementById('na-email')?.value||'';
+  const pass=document.getElementById('na-pass')?.value||'';
+  const errEl=document.getElementById('na-err');
+  const showErr=msg=>{if(errEl)errEl.innerHTML=`<div class="err-msg">⚠ ${esc(msg)}</div>`;};
+  if(!name||!email||!pass){showErr('All fields are required.');return;}
+  if(pass.length<6){showErr('Password must be at least 6 characters.');return;}
+  const r=await api('create_admin',{name,email,password:pass});
+  if(r.error)showErr(r.error);
+  else{A.newAdm={name:'',email:'',pass:''};await refAdmins();toast('Admin account created!');renderContent();}
+}
+
+async function toggleAdmin(id){
+  const r=await api('toggle_admin',{id});
+  if(r.error)toast(r.error,'error');
+  else{A.admins=A.admins.map(a=>a.id==id?{...a,status:r.status}:a);
+    toast(`Admin ${r.status==='active'?'activated':'deactivated'}.`);renderContent();}
+}
+
+async function addPeriod(){
+  const pn=document.getElementById('new-per')?.value.trim()||'';
+  if(!pn){toast('Period name required.','error');return;}
+  const r=await api('add_period',{program:A.currProg,period_name:pn});
+  if(r.error)toast(r.error,'error');
+  else{A.newPer='';await refCurr();A.currPeriod=pn;toast('Period added!');renderContent();}
+}
+
+async function addSubject(){
+  const code=document.getElementById('ns-code')?.value||'';
+  const title=document.getElementById('ns-title')?.value||'';
+  const units=document.getElementById('ns-units')?.value||'3';
+  const prereqs=document.getElementById('ns-prereqs')?.value||'';
+  const errEl=document.getElementById('ns-err');
+  const showErr=msg=>{if(errEl)errEl.innerHTML=`<div class="err-msg">⚠ ${esc(msg)}</div>`;};
+  if(!code||!title){showErr('Subject code and title are required.');return;}
+  const r=await api('add_subject',{program:A.currProg,period:A.currPeriod,code,title,units,prereqs});
+  if(r.error)showErr(r.error);
+  else{A.newSubj={code:'',title:'',units:'3',prereqs:''};await refCurr();toast('Subject added!');renderContent();}
+}
+
+async function removeSubject(id){
+  if(!confirm('Remove this subject from the curriculum?'))return;
+  const r=await api('remove_subject',{id});
+  if(r.error)toast(r.error,'error');
+  else{await refCurr();toast('Subject removed.');renderContent();}
+}
+
+// ============================================================
+// EVENT DELEGATION
+// ============================================================
+document.body.addEventListener('click',function(e){
+  const el=e.target.closest('[data-a]');if(!el)return;
+  e.preventDefault();
+  const a=el.dataset.a,id=el.dataset.id,tab=el.dataset.tab,uid=el.dataset.uid;
+  switch(a){
+    case 'go-reg':     A.page='register';render();break;
+    case 'go-login':   A.page='login';render();break;
+    case 'do-login':   doLogin();break;
+    case 'do-register':doRegister();break;
+    case 'do-logout':  doLogout();break;
+    case 'nav':        A.tab=tab;render();break;
+    case 'save-grades':saveGrades();break;
+    case 'eval-grades':evalGrades();break;
+    case 'save-profile':saveProfile();break;
+    case 'approve':    approveStudent(id);break;
+    case 'reject':     rejectStudent(id);break;
+    case 'view-stu':   A.modal={type:'student',data:A.students.find(s=>s.id==id)};render();break;
+    case 'close-modal':A.modal=null;render();break;
+    case 'save-special':saveSpecial(uid);break;
+    case 'create-admin':createAdmin();break;
+    case 'toggle-admin':toggleAdmin(id);break;
+    case 'add-period': addPeriod();break;
+    case 'add-subject':addSubject();break;
+    case 'rm-subject': removeSubject(id);break;
+    case 'print':      window.print();break;
+  }
+});
+
+document.body.addEventListener('change',function(e){
+  const t=e.target;
+  // Register transferee note
+  if(t.id==='r-type'){const n=document.getElementById('r-transferee');if(n)n.style.display=t.value==='transferee'?'':'none';}
+  // Student filters
+  if(t.id==='stu-q')    {A.stuFilter.q=t.value;renderContent();}
+  if(t.id==='stu-prog')  {A.stuFilter.prog=t.value;renderContent();}
+  if(t.id==='stu-status'){A.stuFilter.status=t.value;renderContent();}
+  if(t.id==='stu-type')  {A.stuFilter.type=t.value;renderContent();}
+  // Curriculum selects
+  if(t.id==='curr-prog'){A.currProg=t.value;const ps=Object.keys(A.curriculum[A.currProg]||{});A.currPeriod=ps[0]||'';renderContent();}
+  if(t.id==='curr-period'){A.currPeriod=t.value;renderContent();}
+});
+
+document.body.addEventListener('input',function(e){
+  const t=e.target;
+  if(t.dataset.grade!==undefined) A.gradeInputs[t.dataset.grade]=t.value;
+  // Persist new period input
+  if(t.id==='new-per') A.newPer=t.value;
+  // Persist new admin fields
+  if(t.id==='na-name')  A.newAdm.name=t.value;
+  if(t.id==='na-email') A.newAdm.email=t.value;
+});
+
+// Allow Enter key on login
+document.body.addEventListener('keydown',function(e){
+  if(e.key==='Enter'&&A.page==='login'){doLogin();}
+});
+
+// ============================================================
+// INIT
+// ============================================================
+async function init(){
+  if(<?=json_encode($loggedIn)?>){
+    await loadData();
+    if(!A.user)A.page='login';
+  }
+  render();
+}
+
+init();
+</script>
+</body>
+</html>
